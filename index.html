@@ -372,11 +372,12 @@ h3,#bars:before,.meal h2{font-weight:700;letter-spacing:-.015em}
     <textarea id="exportBox" style="display:none;margin-top:10px;min-height:120px;font-size:12px" readonly></textarea>
   </div>
   <div class="card">
-    <h3>Google Sheet sync</h3>
-    <div class="fld"><input class="inp" id="syncUrl" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Setup link or …/exec URL"></div>
+    <h3>Live sync</h3>
+    <div class="fld"><input class="inp" id="syncUrl" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Setup link or Supabase project URL"></div>
+    <div class="fld"><input class="inp" id="syncAnon" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Anon key (public)"></div>
     <div class="fld"><input class="inp" id="syncKey" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Sync key"></div>
     <div class="btns"><button class="btn" id="saveSync">Save</button><button class="btn sec" id="syncNow">Sync now</button></div>
-    <div class="hint"><span id="syncStatus2"></span> Paste the setup link from your coach into the first box (it fills both), or the /exec URL and the key. Each change sends that whole day to the sheet about 3 seconds later. Clear the URL to turn sync off. Stored only on this phone.</div>
+    <div class="hint"><span id="syncStatus2"></span> Paste the setup link from your coach into the first box and tap Save (it fills all three). Each change sends that whole day to your coach’s private database about 3 seconds later. Clear the first box to turn sync off. Stored only on this phone.</div>
   </div>
   <div class="card">
     <h3>Custom foods</h3>
@@ -1118,8 +1119,8 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
   'use strict';
   var E = MealEngine;
   var MEALS = ['Breakfast', 'Lunch', 'Snacks', 'Dinner'];
-  // Apps Script web-app URL (…/exec). Keep this EMPTY: the repo is public. The real URL and key live only in
-  // this phone's localStorage (Settings > Google Sheet sync, or a one-tap #sync=<url>&key=<key> setup link).
+  // Supabase project URL. Keep EMPTY: the repo is public. The project URL, anon key and sync key live only in this
+  // phone's localStorage (Settings > Live sync, or a one-tap setup link #sync=<project url>&anon=<anon key>&key=<sync key>).
   var SYNC_URL = '';
   var DEFAULT_TARGETS = { kcal: 2900, p: 160, c: 380, f: 80, fib: 35 };
   var LABEL = { kcal: 'Calories', p: 'Protein', c: 'Carbs', f: 'Fat', fib: 'Fibre' };
@@ -1143,28 +1144,31 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
   function getDay(k) { return load(K.day + k, { items: [] }); }
   function putDay(k, day) { if (!day.items.length) { try { localStorage.removeItem(K.day + k); } catch (e) {} } else save(K.day + k, day); queueSync(k); }
 
-  // ---------- Google Sheet sync ----------
+  // ---------- live sync (Supabase RPC sync_meal) ----------
   function syncKey() { return String(settings.syncKey || '').trim(); }
-  function syncUrl() { return syncKey() ? String((settings.syncUrl || SYNC_URL || '')).trim() : ''; } // no key = sync off
-  // Accepts a full setup link (…#sync=<url>&key=<key>), or just the /exec URL. Returns { url, key } (key may be '').
+  function syncAnon() { return String(settings.syncAnon || '').trim(); }
+  function syncUrl() { return syncKey() && syncAnon() ? String((settings.syncUrl || SYNC_URL || '')).trim().replace(/\/+$/, '') : ''; } // no key = sync off
+  // Accepts a full setup link (…#sync=<url>&anon=<anon>&key=<key>), or just the project URL. Returns { url, anon, key }.
   function parseSetup(text) {
     var t = String(text || '').trim(), i = t.indexOf('#');
     if (i >= 0 && /(^|[#&])sync=/.test(t.slice(i))) {
       var p = {}; t.slice(i + 1).split('&').forEach(function (kv) { var j = kv.indexOf('='); if (j > 0) { try { p[kv.slice(0, j)] = decodeURIComponent(kv.slice(j + 1)); } catch (e) {} } });
-      return { url: String(p.sync || '').trim(), key: String(p.key || '').trim() };
+      return { url: String(p.sync || '').trim().replace(/\/+$/, ''), anon: String(p.anon || '').trim(), key: String(p.key || '').trim() };
     }
-    return { url: t, key: '' };
+    return { url: t.replace(/\/+$/, ''), anon: '', key: '' };
   }
-  var syncTimer = null, syncing = false, syncState = load(K.synced, { t: 0, err: false });
+  function looksSupabase(u) { return /^https:\/\/[a-z0-9-]+\.supabase\.co$/i.test(u); }
+  var syncTimer = null, syncing = false, dirty = {}, syncState = load(K.synced, { t: 0, err: false });
   function queueSync(k) {
     if (!syncUrl()) return;
+    dirty[k] = true;
     var q = load(K.syncq, []); if (q.indexOf(k) < 0) q.push(k); save(K.syncq, q);
     clearTimeout(syncTimer); syncTimer = setTimeout(flushSync, 3000);
   }
   function daySnapshot(k) {
     var day = getDay(k), T = settings.targets, tot = E.sum(day.items);
     return {
-      app: 'meal-tracker', v: 1, key: syncKey(), date: k, sentAt: new Date().toISOString(), targets: T,
+      app: 'meal-tracker', v: 2, date: k, sentAt: new Date().toISOString(), targets: T,
       totals: { kcal: tot.kcal, p: tot.p, c: tot.c, f: tot.f, fib: tot.fib },
       items: day.items.slice().sort(function (a, b) { return a.t - b.t; }).map(function (it) {
         var n = E.nutrition(it);
@@ -1172,32 +1176,47 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
       })
     };
   }
+  // POST {url}/rest/v1/rpc/<fn>. The anon key only lets the phone call the two sync functions; the sync key is checked server-side.
+  function rpc(fn, body) {
+    var a = syncAnon();
+    return fetch(syncUrl() + '/rest/v1/rpc/' + fn, { method: 'POST', mode: 'cors', cache: 'no-store', headers: { 'Content-Type': 'application/json', apikey: a, Authorization: 'Bearer ' + a }, body: JSON.stringify(body) })
+      .then(function (r) { if (r && r.ok) return r; var e = new Error('HTTP ' + (r && r.status)); e.status = r && r.status; throw e; });
+  }
   function flushSync() {
     var url = syncUrl(), q = load(K.syncq, []);
     if (!url || !q.length || syncing) { renderSync(); return; }
     if (navigator.onLine === false || typeof fetch !== 'function') { syncState.err = true; renderSync(); return; }
     syncing = true;
-    var payload = q.length === 1 ? daySnapshot(q[0]) : { app: 'meal-tracker', v: 1, key: syncKey(), days: q.map(daySnapshot).map(function (d) { delete d.key; return d; }) };
-    // text/plain + no-cors = a "simple" request: no preflight, and Apps Script accepts it. The response is opaque.
-    fetch(url, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payload) })
+    var sent = [];
+    // one day per request, oldest first; stop at the first network/auth failure (the rest stay queued)
+    q.reduce(function (p, k) {
+      return p.then(function () {
+        delete dirty[k];
+        return rpc('sync_meal', { p_key: syncKey(), p_date: k, p_snapshot: daySnapshot(k) }).then(function () { sent.push(k); }, function (e) {
+          if (e.status === 400 || e.status === 413) { sent.push(k); return; } // malformed day: drop it rather than block the queue
+          throw e;
+        });
+      });
+    }, Promise.resolve())
+      .then(function () { syncState = { t: Date.now(), err: false }; }, function (e) { syncState = { t: syncState.t || 0, err: true, auth: e.status === 401 || e.status === 403 }; })
       .then(function () {
-        var now = load(K.syncq, []).filter(function (k) { return q.indexOf(k) < 0; }); // keep days changed mid-flight
-        save(K.syncq, now); syncState = { t: Date.now(), err: false }; save(K.synced, syncState);
-      }, function () { syncState.err = true; save(K.synced, syncState); })
-      .then(function () { syncing = false; renderSync(); if (load(K.syncq, []).length && !syncState.err) { clearTimeout(syncTimer); syncTimer = setTimeout(flushSync, 3000); } });
+        save(K.syncq, load(K.syncq, []).filter(function (k) { return sent.indexOf(k) < 0 || dirty[k]; })); // keep days changed mid-flight
+        save(K.synced, syncState); syncing = false; renderSync();
+        if (load(K.syncq, []).length && !syncState.err) { clearTimeout(syncTimer); syncTimer = setTimeout(flushSync, 3000); }
+      });
   }
   function renderSync() {
     var el = $('syncStatus'); if (!el) return;
     var txt = '';
     if (syncUrl()) {
       var pending = load(K.syncq, []).length;
-      if (syncState.err) txt = 'Offline, will retry';
+      if (syncState.err) txt = syncState.auth ? 'Sync key rejected' : 'Offline, will retry';
       else if (pending) txt = 'Syncing…';
       else if (syncState.t) txt = 'Synced · ' + timeStr(syncState.t);
       else txt = 'Sync on';
-    } else if (settings.syncUrl && !syncKey()) txt = 'Sync needs the key';
+    } else if (settings.syncUrl) txt = 'Sync needs the setup link';
     el.textContent = txt;
-    var s2 = $('syncStatus2'); if (s2) s2.textContent = txt || 'Sync is off until a URL is set.';
+    var s2 = $('syncStatus2'); if (s2) s2.textContent = txt || 'Sync is off.';
   }
   window.addEventListener('online', function () { syncState.err = false; flushSync(); });
 
@@ -1380,6 +1399,7 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
     }).join('') : '<div class="empty">None yet. When a food isn’t recognised, enter its macros and tick “Save as custom food”.</div>';
     $('foodCount').textContent = E.foods.length;
     $('syncUrl').value = settings.syncUrl || '';
+    $('syncAnon').value = settings.syncAnon || '';
     $('syncKey').value = settings.syncKey || '';
     renderSync();
   }
@@ -1666,26 +1686,27 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
   }
   $('copyDay').addEventListener('click', function () { copyText(daySummary(cur)); });
   $('saveSync').addEventListener('click', function () {
-    var ps = parseSetup($('syncUrl').value), v = ps.url, key = ps.key || $('syncKey').value.trim();
-    if (v && !/^https:\/\/script\.google(usercontent)?\.com\//.test(v)) { if (!confirm('That doesn’t look like an Apps Script URL. Save anyway?')) return; }
-    if (v && !key) { toast('Add the sync key too'); return; }
-    settings.syncUrl = v; settings.syncKey = v ? key : ''; save(K.settings, settings); $('syncUrl').value = v; $('syncKey').value = settings.syncKey; syncState = { t: 0, err: false }; save(K.synced, syncState);
-    if (v) { var q = load(K.syncq, []); if (q.indexOf(cur) < 0) q.push(cur); save(K.syncq, q); flushSync(); toast('Sync URL saved'); } else { renderSync(); toast('Sync off'); }
+    var ps = parseSetup($('syncUrl').value), v = ps.url, anon = ps.anon || $('syncAnon').value.trim(), key = ps.key || $('syncKey').value.trim();
+    if (v && !looksSupabase(v)) { if (!confirm('That doesn’t look like a Supabase project URL. Save anyway?')) return; }
+    if (v && (!key || !anon)) { toast('Paste the full setup link (or add both keys)'); return; }
+    settings.syncUrl = v; settings.syncAnon = v ? anon : ''; settings.syncKey = v ? key : ''; save(K.settings, settings);
+    $('syncUrl').value = v; $('syncAnon').value = settings.syncAnon; $('syncKey').value = settings.syncKey; syncState = { t: 0, err: false }; save(K.synced, syncState);
+    if (v) { var q = load(K.syncq, []); if (q.indexOf(cur) < 0) q.push(cur); save(K.syncq, q); dirty[cur] = true; flushSync(); toast('Sync saved'); } else { renderSync(); toast('Sync off'); }
   });
   $('syncNow').addEventListener('click', function () {
     if (!syncUrl()) { toast('Set a Sync URL first'); return; }
     var q = load(K.syncq, []); if (q.indexOf(cur) < 0) q.push(cur); save(K.syncq, q); syncState.err = false; flushSync();
   });
 
-  // one-tap setup link: #sync=<url>&key=<key>. The hash never reaches the server; clear it right away.
+  // one-tap setup link: #sync=<url>&anon=<anon>&key=<key>. The hash never reaches the server; clear it right away.
   (function () {
     if (!/(^#|&)sync=/.test(location.hash || '')) return;
     var ps = parseSetup(location.href);
     try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
-    if (!/^https:\/\//.test(ps.url) || !ps.key) { setTimeout(function () { toast('Setup link incomplete'); }, 300); return; }
-    settings.syncUrl = ps.url; settings.syncKey = ps.key; save(K.settings, settings); syncState = { t: 0, err: false }; save(K.synced, syncState);
+    if (!/^https:\/\//.test(ps.url) || !ps.key || !ps.anon) { setTimeout(function () { toast('Setup link incomplete'); }, 300); return; }
+    settings.syncUrl = ps.url; settings.syncAnon = ps.anon; settings.syncKey = ps.key; save(K.settings, settings); syncState = { t: 0, err: false }; save(K.synced, syncState);
     var q = load(K.syncq, []); if (q.indexOf(cur) < 0) q.push(cur); save(K.syncq, q);
-    setTimeout(function () { toast('Google Sheet sync is set up'); }, 300);
+    setTimeout(function () { toast('Live sync is set up'); }, 300);
   })();
   render(); renderSettings(); renderSync();
   if (syncUrl() && load(K.syncq, []).length) setTimeout(flushSync, 1000); // retry anything queued from last time
