@@ -107,6 +107,7 @@ textarea:focus,input:focus,select:focus{border-color:var(--accent)}
 .item.unk .nm{color:var(--text2)}
 .item.unk .sub{color:var(--accent)}
 .tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:9px;border:.5px solid var(--accent);color:var(--accent);margin-left:6px;font-weight:500;vertical-align:2px}
+.itm .sub .coach{color:var(--accent);font-weight:500}
 .tag.muted{border-color:var(--line2);color:var(--muted)}
 .empty{color:var(--faint);padding:10px 0;font-size:14px}
 /* tab bar: sticky at the end of the flow so it never covers content */
@@ -1115,6 +1116,109 @@ var MealEngine = (function () {
 })();
 if (typeof module !== 'undefined') module.exports = MealEngine;
 
+// Meal Tracker two-way sync: per-item merge shared by the app and the coach CLI (meal-log.js).
+// Local day = { items: [item], deleted: [{ id, u, by? }] }. item.u = last change (ms), item.by = 'coach' for coach-added items.
+// Rule: union by id, newest u wins; a tombstone in `deleted` beats an older item. Missing u counts as 0 (pre-sync data).
+// The server (private.merge_meal) applies the same rule, so either side can merge in any order and get the same day.
+var MealSync = (function () {
+  'use strict';
+  var NUT = ['kcal', 'p', 'c', 'f', 'fib'];
+  function u(x) { return x && typeof x.u === 'number' && isFinite(x.u) ? x.u : 0; }
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function hhmm(t) { var d = new Date(t); return pad(d.getHours()) + ':' + pad(d.getMinutes()); }
+  function itemName(E, it) { var f = it.foodId && E.byId(it.foodId); return f ? f.name : (it.name || it.text || 'Item'); }
+  // stable content key, used to tell whether a merge actually changed anything
+  function sig(it) {
+    if (!it) return '';
+    var keys = Object.keys(it).filter(function (k) { return it[k] !== undefined; }).sort();
+    return JSON.stringify(keys.map(function (k) { return [k, it[k]]; }));
+  }
+  // remote snapshot item (v3 has .raw; v2 only has the derived fields) -> local item
+  function fromRemote(si, date) {
+    if (!si || !si.id) return null;
+    if (si.raw && typeof si.raw === 'object') {
+      var r = JSON.parse(JSON.stringify(si.raw)); r.id = si.id;
+      if (typeof si.u === 'number') r.u = si.u; else delete r.u;
+      if (si.by) r.by = si.by;
+      return r;
+    }
+    // v2 item: rebuild as a manual entry with the same macros
+    var t = Date.now();
+    if (date && /^\d\d:\d\d$/.test(si.time || '')) { var a = date.split('-').map(Number), b = si.time.split(':').map(Number); t = new Date(a[0], a[1] - 1, a[2], b[0], b[1]).getTime(); }
+    var m = {}; NUT.forEach(function (k) { m[k] = Number(si[k]) || 0; });
+    var it = { id: si.id, meal: si.meal || 'Snacks', t: t, text: String(si.food || 'Item').replace(/ \(unrecognised\)$/, ''), qty: Number(si.qty) || 1, unit: si.unit || 'serving', foodId: null, name: String(si.food || 'Item').replace(/ \(unrecognised\)$/, ''), manual: m };
+    if (typeof si.u === 'number') it.u = si.u;
+    if (si.by) it.by = si.by;
+    return it;
+  }
+  function remoteDay(snap, date) {
+    snap = snap || {};
+    return {
+      items: (Array.isArray(snap.items) ? snap.items : []).map(function (x) { return fromRemote(x, date || snap.date); }).filter(Boolean),
+      deleted: (Array.isArray(snap.deleted) ? snap.deleted : []).filter(function (d) { return d && d.id; }).map(function (d) { var o = { id: d.id, u: u(d) }; if (d.by) o.by = d.by; return o; })
+    };
+  }
+  // merge(local, remote, preferRemoteOnTie) -> { day, changes: [{ kind: 'added'|'updated'|'removed', item, by }] }
+  // `changes` lists what the remote side changed in the local day (for the "Coach added 2 items" toast).
+  function merge(local, remote, preferRemote) {
+    local = local || {}; remote = remote || {};
+    var best = {}, order = [];
+    function offer(id, rec, side) {
+      var cur = best[id];
+      if (!cur) { best[id] = { rec: rec, side: side }; order.push(id); return; }
+      var a = u(rec), b = u(cur.rec);
+      if (a > b || (a === b && (side === 'r' ? preferRemote : !preferRemote) && cur.side !== side) || (a === b && cur.side === side && rec.del && !cur.rec.del)) best[id] = { rec: rec, side: side };
+    }
+    (local.items || []).forEach(function (it) { if (it && it.id) offer(it.id, it, 'l'); });
+    (local.deleted || []).forEach(function (d) { if (d && d.id) offer(d.id, { id: d.id, u: u(d), by: d.by, del: true }, 'l'); });
+    (remote.items || []).forEach(function (it) { if (it && it.id) offer(it.id, it, 'r'); });
+    (remote.deleted || []).forEach(function (d) { if (d && d.id) offer(d.id, { id: d.id, u: u(d), by: d.by, del: true }, 'r'); });
+    var localById = {}; (local.items || []).forEach(function (it) { if (it && it.id) localById[it.id] = it; });
+    var items = [], deleted = [], changes = [];
+    order.forEach(function (id) {
+      var w = best[id], r = w.rec;
+      if (r.del) { var d = { id: id, u: u(r) }; if (r.by) d.by = r.by; deleted.push(d); }
+      else items.push(r);
+      if (w.side === 'r') {
+        var had = localById[id];
+        if (r.del) { if (had) changes.push({ kind: 'removed', item: had, by: r.by || '' }); }
+        else if (!had) changes.push({ kind: 'added', item: r, by: r.by || '' });
+        else if (sig(had) !== sig(r)) changes.push({ kind: 'updated', item: r, by: r.by || '' });
+      }
+    });
+    items.sort(function (a, b) { return (a.t || 0) - (b.t || 0); });
+    // keep tombstones bounded: drop ones older than 45 days (the server only syncs the last 60 days)
+    var cutoff = Date.now() - 45 * 864e5;
+    deleted = deleted.filter(function (d) { return d.u === 0 || d.u > cutoff; });
+    return { day: { items: items, deleted: deleted }, changes: changes };
+  }
+  // derived (v2-shaped) item for readers + the fields needed to merge
+  function snapItem(E, it) {
+    var n = E.nutrition(it);
+    var o = { id: it.id, time: hhmm(it.t), meal: it.meal, food: itemName(E, it) + (it.unrecognised && !it.manual ? ' (unrecognised)' : ''), qty: it.qty, unit: it.unit, kcal: n.kcal, p: n.p, c: n.c, f: n.f, fib: n.fib, u: u(it) };
+    if (it.by) o.by = it.by;
+    o.raw = it;
+    return o;
+  }
+  function snapshot(E, date, day, extra) {
+    var items = (day.items || []).slice().sort(function (a, b) { return (a.t || 0) - (b.t || 0); }), tot = E.sum(items);
+    var s = { app: 'meal-tracker', v: 3, date: date, sentAt: new Date().toISOString(), totals: { kcal: tot.kcal, p: tot.p, c: tot.c, f: tot.f, fib: tot.fib },
+      items: items.map(function (it) { return snapItem(E, it); }), deleted: (day.deleted || []).slice() };
+    for (var k in (extra || {})) s[k] = extra[k];
+    return s;
+  }
+  // human summary of remote changes: "Coach added 2 items" / "Coach added 1 item · updated 1"
+  function describe(changes) {
+    if (!changes || !changes.length) return '';
+    var coach = changes.filter(function (c) { return c.by === 'coach'; }), list = coach.length ? coach : changes, n = { added: 0, updated: 0, removed: 0 };
+    list.forEach(function (c) { n[c.kind]++; });
+    var parts = []; ['added', 'updated', 'removed'].forEach(function (k) { if (n[k]) parts.push(k + ' ' + n[k] + (parts.length ? '' : ' item' + (n[k] > 1 ? 's' : ''))); });
+    return (coach.length ? 'Coach ' : 'Sync: ') + parts.join(' · ');
+  }
+  return { merge: merge, fromRemote: fromRemote, remoteDay: remoteDay, snapItem: snapItem, snapshot: snapshot, describe: describe, sig: sig, u: u };
+})();
+if (typeof module !== 'undefined') module.exports = MealSync;
+
 (function () {
   'use strict';
   var E = MealEngine;
@@ -1125,7 +1229,8 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
   var DEFAULT_TARGETS = { kcal: 2900, p: 160, c: 380, f: 80, fib: 35 };
   var LABEL = { kcal: 'Calories', p: 'Protein', c: 'Carbs', f: 'Fat', fib: 'Fibre' };
   var COLOR = { kcal: 'var(--accent)', p: 'var(--text)', c: 'var(--text)', f: 'var(--text)', fib: 'var(--text)' };
-  var K = { day: 'mealtracker.v1.day.', settings: 'mealtracker.v1.settings', custom: 'mealtracker.v1.custom', usage: 'mealtracker.v1.usage', syncq: 'mealtracker.v1.syncq', synced: 'mealtracker.v1.synced' };
+  var K = { day: 'mealtracker.v1.day.', settings: 'mealtracker.v1.settings', custom: 'mealtracker.v1.custom', usage: 'mealtracker.v1.usage', syncq: 'mealtracker.v1.syncq', synced: 'mealtracker.v1.synced', pulled: 'mealtracker.v1.pulled', v3: 'mealtracker.v1.sync3' };
+  var S = MealSync;
   var SEEDS = ['1 scoop whey', '2 eggs', '1 banana', '200g greek yoghurt', '2 roti', '1 bowl dal', '1 tbsp peanut butter', '250ml whole milk', '1 bowl rice', '40g oats'];
 
   // ---------- storage ----------
@@ -1141,8 +1246,11 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
   function parseKey(k) { var a = k.split('-').map(Number); return new Date(a[0], a[1] - 1, a[2]); }
   function addDays(k, n) { var d = parseKey(k); d.setDate(d.getDate() + n); return dkey(d); }
   var cur = dkey(new Date());
-  function getDay(k) { return load(K.day + k, { items: [] }); }
-  function putDay(k, day) { if (!day.items.length) { try { localStorage.removeItem(K.day + k); } catch (e) {} } else save(K.day + k, day); queueSync(k); }
+  function getDay(k) { var d = load(K.day + k, null); if (!d || !Array.isArray(d.items)) d = { items: [] }; if (!Array.isArray(d.deleted)) d.deleted = []; return d; }
+  // a day is kept while it has items OR tombstones (tombstones carry deletes to the server and the coach)
+  function storeDay(k, day) { if (!day.items.length && !(day.deleted || []).length) { try { localStorage.removeItem(K.day + k); } catch (e) {} } else save(K.day + k, day); }
+  function putDay(k, day) { storeDay(k, day); queueSync(k); }
+  function tomb(day, it) { day.deleted = (day.deleted || []).filter(function (d) { return d.id !== it.id; }); var d = { id: it.id, u: Date.now() }; if (it.by) d.by = it.by; day.deleted.push(d); }
 
   // ---------- live sync (Supabase RPC sync_meal) ----------
   function syncKey() { return String(settings.syncKey || '').trim(); }
@@ -1165,16 +1273,42 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
     var q = load(K.syncq, []); if (q.indexOf(k) < 0) q.push(k); save(K.syncq, q);
     clearTimeout(syncTimer); syncTimer = setTimeout(flushSync, 3000);
   }
-  function daySnapshot(k) {
-    var day = getDay(k), T = settings.targets, tot = E.sum(day.items);
-    return {
-      app: 'meal-tracker', v: 2, date: k, sentAt: new Date().toISOString(), targets: T,
-      totals: { kcal: tot.kcal, p: tot.p, c: tot.c, f: tot.f, fib: tot.fib },
-      items: day.items.slice().sort(function (a, b) { return a.t - b.t; }).map(function (it) {
-        var n = E.nutrition(it);
-        return { id: it.id, time: timeStr(it.t), meal: it.meal, food: itemName(it) + (it.unrecognised && !it.manual ? ' (unrecognised)' : ''), qty: it.qty, unit: it.unit, kcal: n.kcal, p: n.p, c: n.c, f: n.f, fib: n.fib };
-      })
-    };
+  // v3 snapshot: the v2 fields (items with macros, totals) plus per-item u/by/raw and tombstones, so the server can merge per item
+  function daySnapshot(k) { return S.snapshot(E, k, getDay(k), { targets: settings.targets, origin: 'phone' }); }
+  // ---------- pull (coach edits) ----------
+  // Merge a server copy of day k into the phone. Returns the remote changes. Pushes back if the phone has something the server lacks.
+  var pullUnsupported = false, pulling = false;
+  function applyRemote(k, snap) {
+    if (!snap || !/^\d{4}-\d{2}-\d{2}$/.test(k)) return [];
+    var local = getDay(k), rem = S.remoteDay(snap, k), m = S.merge(local, rem, false);
+    var before = S.sig({ i: local.items.map(S.sig), d: local.deleted.map(S.sig) }), after = S.sig({ i: m.day.items.map(S.sig), d: m.day.deleted.map(S.sig) });
+    if (before !== after) storeDay(k, m.day);
+    // does the server need the phone's copy? (phone-only items/tombstones, newer edits, or v2 rows without raw/u)
+    var rb = {}; (snap.items || []).forEach(function (x) { if (x && x.id) rb[x.id] = x; }); (snap.deleted || []).forEach(function (x) { if (x && x.id) rb[x.id] = { u: S.u(x), del: true }; });
+    var need = snap.v !== 3 || m.day.items.some(function (it) { var r = rb[it.id]; return !r || r.del || S.u(r) < S.u(it) || !r.raw; }) || m.day.deleted.some(function (d) { var r = rb[d.id]; return !r || (!r.del && S.u(r) <= d.u); });
+    if (need && (m.day.items.length || m.day.deleted.length)) queueSync(k);
+    return m.changes;
+  }
+  function announce(byDay) {
+    var keys = Object.keys(byDay).filter(function (k) { return byDay[k].length; }); if (!keys.length) return;
+    var all = [].concat.apply([], keys.map(function (k) { return byDay[k]; })), msg = S.describe(all);
+    if (keys.length === 1 && keys[0] !== cur) msg += ' to ' + parseKey(keys[0]).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
+    render(); toast(msg);
+  }
+  function pullSync() {
+    if (!syncUrl() || pullUnsupported || pulling || typeof fetch !== 'function' || navigator.onLine === false) return Promise.resolve();
+    pulling = true;
+    var since = load(K.pulled, null) || new Date(Date.now() - 21 * 864e5).toISOString();
+    return rpc('get_meal_since', { p_key: syncKey(), p_since: since }).then(function (r) { return r.json(); }).then(function (res) {
+      var byDay = {};
+      (res && res.days || []).forEach(function (d) { if (d && d.date && d.snapshot) byDay[d.date] = (byDay[d.date] || []).concat(applyRemote(String(d.date), d.snapshot)); });
+      // next pull: everything changed since a minute before the server's clock (merging is idempotent, so overlap is harmless)
+      var days = res && res.days || [];
+      if (days.length >= 31 && days[days.length - 1].updated_at) { save(K.pulled, days[days.length - 1].updated_at); setTimeout(pullSync, 1000); } // page limit hit: continue from the last row
+      else if (res && res.now) { var t = new Date(new Date(res.now).getTime() - 60000); if (!isNaN(t)) save(K.pulled, t.toISOString()); }
+      announce(byDay);
+    }, function (e) { if (e && e.status === 404) pullUnsupported = true; /* server not upgraded yet: push-only, like before */ })
+      .then(function () { pulling = false; }, function () { pulling = false; });
   }
   // POST {url}/rest/v1/rpc/<fn>. The anon key only lets the phone call the two sync functions; the sync key is checked server-side.
   function rpc(fn, body) {
@@ -1192,7 +1326,13 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
     q.reduce(function (p, k) {
       return p.then(function () {
         delete dirty[k];
-        return rpc('sync_meal', { p_key: syncKey(), p_date: k, p_snapshot: daySnapshot(k) }).then(function () { sent.push(k); }, function (e) {
+        return rpc('sync_meal', { p_key: syncKey(), p_date: k, p_snapshot: daySnapshot(k) }).then(function (r) {
+          sent.push(k);
+          // v3 server replies with the merged day (phone + coach); fold it in. Older servers reply { ok, date } only.
+          return Promise.resolve(r && typeof r.json === 'function' ? r.json() : null).then(function (res) {
+            if (res && res.v === 3 && res.snapshot) { var ch = applyRemote(k, res.snapshot); if (ch.length) { var o = {}; o[k] = ch; announce(o); } }
+          }, function () {});
+        }, function (e) {
           if (e.status === 400 || e.status === 413) { sent.push(k); return; } // malformed day: drop it rather than block the queue
           throw e;
         });
@@ -1278,15 +1418,15 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
   function addItems(items, meal) {
     var day = getDay(cur), t = Date.now();
     items.forEach(function (it) {
-      var rec = { id: uid(), meal: meal, t: t, text: it.text, qty: it.qty, unit: it.unit, foodId: it.foodId || null, name: it.name };
+      var rec = { id: uid(), meal: meal, t: t, text: it.text, qty: it.qty, unit: it.unit, foodId: it.foodId || null, name: it.name, u: t };
       if (it.unrecognised) rec.unrecognised = true;
       if (it.manual) rec.manual = it.manual;
       day.items.push(rec); bumpUsage(rec);
     });
     putDay(cur, day);
   }
-  function updateItem(id, fn) { var day = getDay(cur); day.items.forEach(function (it) { if (it.id === id) fn(it); }); putDay(cur, day); }
-  function deleteItem(id) { var day = getDay(cur); day.items = day.items.filter(function (it) { return it.id !== id; }); putDay(cur, day); }
+  function updateItem(id, fn) { var day = getDay(cur), now = Date.now(); day.items.forEach(function (it) { if (it.id === id) { fn(it); delete it.ed; it.u = Math.max(now, S.u(it) + 1); } }); putDay(cur, day); }
+  function deleteItem(id) { var day = getDay(cur); day.items = day.items.filter(function (it) { if (it.id === id) { tomb(day, it); return false; } return true; }); putDay(cur, day); }
   function stepFor(it) { if (it.unit === 'g' || it.unit === 'ml') return it.qty >= 200 ? 50 : 10; return it.qty < 1 || (it.qty % 1) ? 0.25 : 1; }
 
   // ---------- render ----------
@@ -1340,7 +1480,7 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
         var n = E.nutrition(it), unk = it.unrecognised && !it.manual;
         var sub = unk ? 'Not recognised: tap to enter macros' : (r0(n.p) + 'P · ' + r0(n.c) + 'C · ' + r0(n.f) + 'F · ' + r0(n.fib) + ' fibre' + (n.grams ? ' · ' + r0(n.grams) + (/(ml|glass|cup|mug|pint|can|shot|splash|bottle)/.test(it.unit) && isLiquid(it) ? ' ml' : ' g') : '') + ' · ' + timeStr(it.t));
         html += '<div class="item' + (unk ? ' unk' : '') + '"><button class="step" data-dec="' + it.id + '" aria-label="Less">−</button>' +
-          '<button class="itm" data-edit="' + it.id + '"><span class="kc">' + (unk ? '?' : fmt(n.kcal)) + '</span><div class="nm"><span class="q">' + esc(qtyText(it)) + '</span> ' + esc(itemName(it)) + (unk ? '<span class="tag">needs details</span>' : '') + (it.manual && !unk ? '<span class="tag muted">manual</span>' : '') + '</div><div class="sub">' + esc(sub) + '</div></button>' +
+          '<button class="itm" data-edit="' + it.id + '"><span class="kc">' + (unk ? '?' : fmt(n.kcal)) + '</span><div class="nm"><span class="q">' + esc(qtyText(it)) + '</span> ' + esc(itemName(it)) + (unk ? '<span class="tag">needs details</span>' : '') + (it.manual && !unk && !it.by ? '<span class="tag muted">manual</span>' : '') + '</div><div class="sub">' + (it.by === 'coach' ? '<span class="coach">Coach</span> · ' : it.ed === 'coach' ? '<span class="coach">Coach edit</span> · ' : '') + esc(sub) + '</div></button>' +
           '<button class="step" data-inc="' + it.id + '" aria-label="More">+</button></div>';
       });
       html += '</div>';
@@ -1438,8 +1578,8 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
       h += '<div class="fld"><label>' + (f ? 'Manual macros for this entry' : 'Not recognised: enter macros for this entry') + '</label><div class="grid5">' + ['kcal', 'p', 'c', 'f', 'fib'].map(function (k) {
         return '<div><label>' + (k === 'kcal' ? 'kcal' : LABEL[k]) + '</label><input class="inp" type="number" inputmode="decimal" step="any" min="0" data-man="' + k + '" value="' + (m[k] != null ? m[k] : '') + '"></div>';
       }).join('') + '</div></div>';
-      h += '<label class="chk"><input type="checkbox" id="saveCustom"' + (f ? '' : ' checked') + '> Save as custom food for next time</label>';
-      h += '<div class="fld" id="cfNameWrap"><input class="inp" id="cfName" placeholder="Food name" value="' + esc(f ? f.name : (d.name || d.text || '')) + '"></div>';
+      h += '<label class="chk"><input type="checkbox" id="saveCustom"' + (f || d.by === 'coach' ? '' : ' checked') + '> Save as custom food for next time</label>';
+      h += '<div class="fld" id="cfNameWrap"' + (!f && d.by === 'coach' ? ' style="display:none"' : '') + '><input class="inp" id="cfName" placeholder="Food name" value="' + esc(f ? f.name : (d.name || d.text || '')) + '"></div>';
     }
     h += '<div class="fld"><label>' + (f ? 'Wrong food? Search to change it' : 'Or search the food list') + '</label><input class="inp" id="fSearch" type="search" placeholder="Search foods…" autocomplete="off" value=""><div class="res" id="fRes"></div></div>';
     h += '<div class="fld"><label>Meal</label><select class="inp" id="mSel">' + MEALS.map(function (m) { return '<option' + (m === d.meal ? ' selected' : '') + '>' + m + '</option>'; }).join('') + '</select></div>';
@@ -1496,7 +1636,7 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
         toast('Saved “' + name + '” as a custom food');
       } else { d.manual = m; if (!d.foodId) d.unrecognised = true; }
     }
-    if (st.mode === 'edit') { updateItem(st.id, function (it) { Object.keys(it).forEach(function (k) { delete it[k]; }); Object.assign(it, d); }); bumpUsage(d); }
+    if (st.mode === 'edit') { updateItem(st.id, function (it) { var by = it.by; Object.keys(it).forEach(function (k) { delete it[k]; }); Object.assign(it, d); if (by) it.by = by; }); bumpUsage(d); }
     else addItems([d], d.meal);
     closeSheet(); render(); renderSettings();
   }
@@ -1626,7 +1766,7 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
     if (!confirm('Delete this custom food? Past entries using it will show as unrecognised.')) return;
     custom = custom.filter(function (c) { return c.id !== id; }); save(K.custom, custom); E.removeCustom(id); renderSettings(); render();
   });
-  $('clearDay').addEventListener('click', function () { if (confirm('Delete every entry for this day?')) { putDay(cur, { items: [] }); render(); toast('Day cleared'); } });
+  $('clearDay').addEventListener('click', function () { if (confirm('Delete every entry for this day?')) { var day = getDay(cur); day.items.forEach(function (it) { tomb(day, it); }); day.items = []; putDay(cur, day); render(); toast('Day cleared'); } });
   function exportData() {
     var days = {};
     for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); if (k && k.indexOf(K.day) === 0) days[k.slice(K.day.length)] = load(k, { items: [] }); }
@@ -1654,7 +1794,14 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
         if (!data || (data.app !== 'meal-tracker' && data.app !== 'fuel') || !data.days) throw new Error('Not a Meal Tracker backup');
         var n = Object.keys(data.days).length;
         if (!confirm('Import ' + n + ' day(s)? Days in the backup replace the same days here.')) return;
-        Object.keys(data.days).forEach(function (k) { if (/^\d{4}-\d{2}-\d{2}$/.test(k) && data.days[k] && Array.isArray(data.days[k].items)) { save(K.day + k, data.days[k]); queueSync(k); } });
+        Object.keys(data.days).forEach(function (k) {
+          if (!(/^\d{4}-\d{2}-\d{2}$/.test(k) && data.days[k] && Array.isArray(data.days[k].items))) return;
+          // the backup replaces the day: its items become the newest version, anything else on the day is deleted
+          var now = Date.now(), old = getDay(k), nd = { items: data.days[k].items.filter(function (it) { return it && it.id; }).map(function (it) { var c = JSON.parse(JSON.stringify(it)); c.u = now; return c; }), deleted: [] };
+          var keep = {}; nd.items.forEach(function (it) { keep[it.id] = 1; });
+          old.items.forEach(function (it) { if (!keep[it.id]) tomb(nd, it); });
+          putDay(k, nd);
+        });
         if (data.settings && data.settings.targets) { settings.targets = Object.assign({}, DEFAULT_TARGETS, data.settings.targets); save(K.settings, settings); }
         if (Array.isArray(data.custom)) { data.custom.forEach(function (cf) { if (cf && cf.id && cf.per100 && cf.units) { custom = custom.filter(function (c) { return c.id !== cf.id; }); custom.push(cf); E.removeCustom(cf.id); E.addCustom(cf); } }); save(K.custom, custom); }
         if (data.usage && typeof data.usage === 'object') { usage = Object.assign(usage, data.usage); save(K.usage, usage); }
@@ -1666,7 +1813,9 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
   });
   // refresh when the app comes back to the foreground on a new day
   var lastToday = dkey(new Date());
-  document.addEventListener('visibilitychange', function () { if (!document.hidden) { var t = dkey(new Date()); if (t !== lastToday) { if (cur === lastToday) cur = t; lastToday = t; } render(); if (load(K.syncq, []).length) { syncState.err = false; flushSync(); } } });
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) { var t = dkey(new Date()); if (t !== lastToday) { if (cur === lastToday) cur = t; lastToday = t; } render(); if (load(K.syncq, []).length) { syncState.err = false; flushSync(); } pullSync(); } });
+  // while the app is on screen, check for coach edits every 30 s
+  setInterval(function () { if (!document.hidden) pullSync(); }, 30000);
 
   function daySummary(k) {
     var day = getDay(k), T = settings.targets, tot = E.sum(day.items), d = parseKey(k);
@@ -1705,12 +1854,20 @@ if (typeof module !== 'undefined') module.exports = MealEngine;
     try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
     if (!/^https:\/\//.test(ps.url) || !ps.key || !ps.anon) { setTimeout(function () { toast('Setup link incomplete'); }, 300); return; }
     settings.syncUrl = ps.url; settings.syncAnon = ps.anon; settings.syncKey = ps.key; save(K.settings, settings); syncState = { t: 0, err: false }; save(K.synced, syncState);
-    var q = load(K.syncq, []); if (q.indexOf(cur) < 0) q.push(cur); save(K.syncq, q);
+    var q = load(K.syncq, []); if (q.indexOf(cur) < 0) q.push(cur); save(K.syncq, q); try { localStorage.removeItem(K.pulled); } catch (e) {}
     setTimeout(function () { toast('Live sync is set up'); }, 300);
   })();
   render(); renderSettings(); renderSync();
-  if (syncUrl() && load(K.syncq, []).length) setTimeout(flushSync, 1000); // retry anything queued from last time
-  window.__mt = { E: E, render: render, getDay: function () { return getDay(cur); }, cur: function () { return cur; }, daySummary: daySummary, snapshot: daySnapshot };
+  // first run of two-way sync: send the last 14 days once, so the server has every item's full record (older apps sent a summary only)
+  if (syncUrl() && !load(K.v3, false)) {
+    var q0 = load(K.syncq, []);
+    for (var i0 = 13; i0 >= 0; i0--) { var k0 = addDays(dkey(new Date()), -i0), d0 = getDay(k0); if ((d0.items.length || d0.deleted.length) && q0.indexOf(k0) < 0) q0.push(k0); }
+    save(K.syncq, q0); save(K.v3, true);
+  }
+  var queuedAtLoad = load(K.syncq, []).length > 0;
+  if (syncUrl()) setTimeout(function () { pullSync().then(function () { if (queuedAtLoad) flushSync(); }); }, 500); // pull coach edits, then retry anything queued last time
+  else if (load(K.syncq, []).length) setTimeout(flushSync, 1000);
+  window.__mt = { E: E, render: render, getDay: function () { return getDay(cur); }, cur: function () { return cur; }, daySummary: daySummary, snapshot: daySnapshot, pull: pullSync };
 })();
 
 </script>
