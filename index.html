@@ -1463,6 +1463,19 @@ if (typeof module !== 'undefined') module.exports = MealSync;
     if (ratio > (k === 'fib' ? MACRO_TOL.fibOver : MACRO_TOL.over)) return 'over';
     return 'ok';
   }
+  // Past-day line, same rules as the bar colours (so it never contradicts the headline or the bars).
+  // e.g. "Protein on target, fat 49 g over."  Only "Targets hit this day." when calories and every macro are green.
+  function pastSummary(tot, T) {
+    var kr = T.kcal > 0 ? tot.kcal / T.kcal : 0, kOk = kr >= MACRO_TOL.under && kr <= MACRO_TOL.over;
+    var st = {}; ['p', 'c', 'f', 'fib'].forEach(function (k) { st[k] = macroState(k, T[k] > 0 ? tot[k] / T[k] : 0); });
+    if (kOk && st.p === 'ok' && st.c === 'ok' && st.f === 'ok' && st.fib === 'ok') return 'Targets hit this day.';
+    function diff(k) { var d = r0(Math.abs(tot[k] - T[k])); return d + ' g ' + (tot[k] > T[k] ? 'over' : 'short'); }
+    var parts = [st.p === 'ok' ? 'protein on target' : 'protein ' + diff('p')];
+    ['f', 'c', 'fib'].forEach(function (k) { if (st[k] === 'over') parts.push(LABEL[k].toLowerCase() + ' ' + diff(k)); });
+    ['c', 'f', 'fib'].forEach(function (k) { if (st[k] === 'under' || st[k] === 'none') parts.push(LABEL[k].toLowerCase() + ' ' + diff(k)); });
+    var txt = parts.slice(0, 3).join(', ');
+    return txt.charAt(0).toUpperCase() + txt.slice(1) + '.';
+  }
   function renderHeader() {
     var today = dkey(new Date()), d = parseKey(cur);
     var main = cur === today ? 'Today' : cur === addDays(today, -1) ? 'Yesterday' : d.toLocaleDateString('en-GB', { weekday: 'long' });
@@ -1494,8 +1507,7 @@ if (typeof module !== 'undefined') module.exports = MealSync;
     if (cur === today) nudge = E.nudge(tot, T, new Date().getHours());
     else if (!day.items.length) nudge = 'Nothing logged for this day.';
     else {
-      var sk = T.kcal - tot.kcal, sp = T.p - tot.p;
-      nudge = (sk <= 100 && sp <= 5) ? 'Targets hit this day.' : 'This day ended ' + (sk > 100 ? fmt(sk) + ' kcal' : '') + (sk > 100 && sp > 5 ? ' and ' : '') + (sp > 5 ? r0(sp) + ' g protein' : '') + ' short.';
+      nudge = pastSummary(tot, T);
     }
     $('nudge').textContent = nudge;
     // meal pills
