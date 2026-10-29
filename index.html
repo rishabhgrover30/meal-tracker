@@ -308,17 +308,39 @@ h3,#bars:before,.meal h2{font-weight:700;letter-spacing:-.015em}
 .set input{font-weight:600}
 .nudge:after{font-weight:700}
 /* Today jump: Oura hid it; bring it back as a small frosted pill (app hides it when already on today) */
-.todaybtn{display:inline-flex;align-items:center;position:absolute;left:0;top:0;height:44px;padding:0 14px;border-radius:99px;background:var(--frost);border:.5px solid var(--frost-bd);color:var(--text);font-size:14px;font-weight:600}
+/* Today jump (v2): lives in its own row under the day nav, next to the date, so it never overlaps the title.
+   The row is always there (shows the date on today too), so switching days never shifts the layout. */
+.dayrow{display:flex;align-items:center;justify-content:center;gap:10px;height:30px;margin-top:6px;font-size:14px;font-weight:500;color:var(--muted)}
+.todaybtn{display:inline-flex;align-items:center;gap:5px;position:static;height:28px;padding:0 11px 0 9px;border-radius:99px;background:var(--frost);border:.5px solid var(--frost-bd);color:var(--text);font-size:13px;font-weight:600}
+.todaybtn[hidden]{display:none}
+.todaybtn svg{opacity:.8}
+/* Macro status colours (desaturated, tuned for the dark theme): under = amber, on target = green, over = red */
+:root{--st-under:#c9a86a;--st-ok:#86bb9a;--st-over:#d47a6c}
+.track{height:4px}
+.bar .fill{transition:width .25s ease}
+.bar.st-under .fill{background:var(--st-under)!important}
+.bar.st-ok .fill{background:var(--st-ok)!important}
+.bar.st-over .fill{background:var(--st-over)!important}
+.bar.st-over .lbl span{color:var(--st-over)}
+.bar .ovr{font-style:normal;font-size:13px;font-weight:600;color:var(--st-over);background:rgba(212,122,108,.14);border-radius:99px;padding:2px 8px;margin-right:8px;vertical-align:1px}
+.th-status.st-under{color:var(--st-under)}.th-status.st-ok{color:var(--st-ok)}.th-status.st-over{color:var(--st-over)}.th-status.st-none{color:var(--muted)}
+/* stop the browser's own horizontal overscroll (back/forward gesture) from stealing the day swipe */
+html,body{overscroll-behavior-x:none}
+/* swipe between days: small slide-in so the change of day is visible */
+@keyframes dayInL{from{opacity:.25;transform:translateX(28px)}to{opacity:1;transform:none}}
+@keyframes dayInR{from{opacity:.25;transform:translateX(-28px)}to{opacity:1;transform:none}}
+#v-log.in-l{animation:dayInL .2s ease-out}#v-log.in-r{animation:dayInR .2s ease-out}
 
 </style>
 </head>
 <body>
 <header class="hdr">
-  <div class="topbar"><span class="appname">Meal Tracker <span class="sync" id="syncStatus"></span></span><button class="todaybtn" id="goToday">Today</button></div>
+  <div class="topbar"><span class="appname">Meal Tracker <span class="sync" id="syncStatus"></span></span></div>
   <div class="titlerow">
     <div class="datelbl"><h1 id="dateMain">Today</h1><small id="dateSub"></small><input type="date" id="datePick" aria-label="Pick date"></div>
     <div class="datenav"><button id="prevDay" aria-label="Previous day"><svg viewBox="0 0 24 24" width="20" height="20"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button><button id="nextDay" aria-label="Next day"><svg viewBox="0 0 24 24" width="20" height="20"><path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
   </div>
+  <div class="dayrow"><span id="dayDate"></span><button class="todaybtn" id="goToday" hidden aria-label="Back to today"><svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path d="M9 14l-4-4 4-4M5 10h9a5 5 0 0 1 0 10h-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Today</button></div>
 </header>
 
 <main>
@@ -1430,13 +1452,25 @@ if (typeof module !== 'undefined') module.exports = MealSync;
   function stepFor(it) { if (it.unit === 'g' || it.unit === 'ml') return it.qty >= 200 ? 50 : 10; return it.qty < 1 || (it.qty % 1) ? 0.25 : 1; }
 
   // ---------- render ----------
+  // Macro bar status. ratio = eaten / target.
+  //   Protein, carbs, fat: < 85% under (amber) · 85–105% on target (green) · > 105% over (red).
+  //   Fibre is a minimum: anything from 85% up is green; only > 130% turns red (bloating risk).
+  //   Nothing logged = no colour.
+  var MACRO_TOL = { under: 0.85, over: 1.05, fibOver: 1.30 };
+  function macroState(k, ratio) {
+    if (!(ratio > 0)) return 'none';
+    if (ratio < MACRO_TOL.under) return 'under';
+    if (ratio > (k === 'fib' ? MACRO_TOL.fibOver : MACRO_TOL.over)) return 'over';
+    return 'ok';
+  }
   function renderHeader() {
     var today = dkey(new Date()), d = parseKey(cur);
     var main = cur === today ? 'Today' : cur === addDays(today, -1) ? 'Yesterday' : d.toLocaleDateString('en-GB', { weekday: 'long' });
     $('dateMain').textContent = main;
     $('dateSub').textContent = d.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
     $('datePick').value = cur;
-    $('goToday').style.visibility = cur === today ? 'hidden' : 'visible';
+    $('dayDate').textContent = d.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
+    $('goToday').hidden = cur === today;
     $('nextDay').style.opacity = cur >= today ? '.3' : '1';
   }
   function ringSvg(val, target) {
@@ -1450,8 +1484,9 @@ if (typeof module !== 'undefined') module.exports = MealSync;
     var day = getDay(cur), T = settings.targets, tot = E.sum(day.items);
     $('ring').innerHTML = ringSvg(tot.kcal, T.kcal);
     $('bars').innerHTML = ['p', 'c', 'f', 'fib'].map(function (k) {
-      var pct = Math.min(100, tot[k] / T[k] * 100);
-      return '<div class="bar"><div class="lbl"><b>' + LABEL[k] + '</b><span>' + r0(tot[k]) + ' / ' + T[k] + ' g</span></div><div class="track"><div class="fill" style="width:' + pct.toFixed(1) + '%;background:' + COLOR[k] + '"></div></div></div>';
+      var ratio = T[k] > 0 ? tot[k] / T[k] : 0, st = macroState(k, ratio), pct = Math.min(100, ratio * 100);
+      var ovr = st === 'over' ? '<i class="ovr">+' + r0(tot[k] - T[k]) + ' g</i>' : '';
+      return '<div class="bar st-' + st + '"><div class="lbl"><b>' + LABEL[k] + '</b><span>' + ovr + r0(tot[k]) + ' / ' + T[k] + ' g</span></div><div class="track"><div class="fill" style="width:' + pct.toFixed(1) + '%;background:' + COLOR[k] + '"></div></div></div>';
     }).join('');
     $('leftRow').innerHTML = ['p', 'c', 'f', 'fib'].map(function (k) { var l = T[k] - tot[k]; return '<span><small>' + LABEL[k] + ' left</small><b>' + (l > 0 ? r0(l) + ' g' : '✓ done') + '</b></span>'; }).join('');
     var today = dkey(new Date());
@@ -1740,8 +1775,37 @@ if (typeof module !== 'undefined') module.exports = MealSync;
     } else if (t.id === 'saveCustom') { $('cfNameWrap').style.display = t.checked ? '' : 'none'; }
   });
   // day nav
-  $('prevDay').addEventListener('click', function () { cur = addDays(cur, -1); selMeal = null; render(); });
-  $('nextDay').addEventListener('click', function () { if (cur < dkey(new Date())) { cur = addDays(cur, 1); selMeal = null; render(); } });
+  function stepDay(n, anim) {
+    if (n > 0 && cur >= dkey(new Date())) return false; // never past today (same rule as the arrow)
+    cur = addDays(cur, n); selMeal = null; render();
+    if (anim) { var v = $('v-log'); v.classList.remove('in-l', 'in-r'); void v.offsetWidth; v.classList.add(n > 0 ? 'in-l' : 'in-r'); }
+    return true;
+  }
+  $('prevDay').addEventListener('click', function () { stepDay(-1); });
+  $('nextDay').addEventListener('click', function () { stepDay(1); });
+  // swipe left/right on the day view (header + Log tab) = next/previous day.
+  // Ignores mostly-vertical drags (so scrolling works), fields, the horizontal pill/chip strips and open sheets.
+  (function () {
+    var sx = 0, sy = 0, st = 0, on = false;
+    function eligible(t) {
+      if (activeView !== 'log') return false;
+      if ($('sheet').classList.contains('on') || document.body.classList.contains('sheet-open')) return false;
+      if (!t.closest || !t.closest('.hdr, #v-log')) return false;
+      return !t.closest('input, textarea, select, [contenteditable], .meals, .chips, .res, #datePick');
+    }
+    document.addEventListener('touchstart', function (e) {
+      on = e.touches.length === 1 && eligible(e.target);
+      if (on) { sx = e.touches[0].clientX; sy = e.touches[0].clientY; st = Date.now(); }
+    }, { passive: true });
+    document.addEventListener('touchcancel', function () { on = false; }, { passive: true });
+    document.addEventListener('touchend', function (e) {
+      if (!on) return; on = false;
+      var t = e.changedTouches[0], dx = t.clientX - sx, dy = t.clientY - sy;
+      if (Math.abs(dx) < 50 || Math.abs(dx) < Math.abs(dy) * 1.5 || Date.now() - st > 800) return;
+      var a = document.activeElement; if (a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) return;
+      stepDay(dx < 0 ? 1 : -1, true);
+    }, { passive: true });
+  })();
   $('goToday').addEventListener('click', function () { cur = dkey(new Date()); selMeal = null; render(); });
   $('datePick').addEventListener('change', function (e) { if (e.target.value) { cur = e.target.value; selMeal = null; render(); } });
   // tabs
@@ -1889,7 +1953,7 @@ if (typeof module !== 'undefined') module.exports = MealSync;
     var val = num(big.textContent), tgt = num(sm && sm.textContent) || 1, pct = val / tgt;
     // hero status word beside the number
     if (!ring.querySelector('.th-status')) {
-      var st = pct > 1.1 ? ['OVER', 'warn'] : pct >= 0.9 ? ['OPTIMAL', 'ok'] : pct >= 0.45 ? ['GOOD', 'ok'] : pct > 0 ? ['BEHIND', 'warn'] : ['START', 'ok'];
+      var st = pct > 1.05 ? ['OVER', 'st-over'] : pct >= 0.85 ? ['ON TARGET', 'st-ok'] : pct > 0 ? ['UNDER', 'st-under'] : ['START', 'st-none'];
       var unit = el('span', 'th-unit', 'kcal'), s = el('span', 'th-status ' + st[1], st[0]);
       big.appendChild(unit); big.appendChild(s);
     }
@@ -1901,12 +1965,7 @@ if (typeof module !== 'undefined') module.exports = MealSync;
       var txt = val === 0 ? 'A fresh start' : left > 0 ? 'You\u2019re ' + left.toLocaleString('en-GB') + ' kcal short' : left > -150 ? 'Right on target' : 'You\u2019re ' + (-left).toLocaleString('en-GB') + ' kcal over';
       if (h.textContent !== txt) h.textContent = txt;
     }
-    // contributor rows: coral when a macro lags the calorie pace
-    [].forEach.call(bars.querySelectorAll('.bar'), function (b) {
-      var sp = b.querySelector('.lbl span'); if (!sp) return;
-      var a = sp.textContent.split('/'), p = num(a[0]) / (num(a[1]) || 1);
-      b.classList.toggle('behind', pct > 0.15 && p < pct * 0.8);
-    });
+    // macro rows are coloured by the app itself (st-under / st-ok / st-over), see macroState()
   }
 
   function workout() {
